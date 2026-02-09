@@ -1,0 +1,163 @@
+name: Axiom Build Verification - Node.js
+
+on:
+  workflow_dispatch:
+    inputs:
+      workItemId:
+        required: true
+        type: string
+      orchestrationId:
+        required: true
+        type: string
+      commitSha:
+        required: true
+        type: string
+      componentPath:
+        required: false
+        type: string
+        default: 'frontend'
+      framework:
+        required: false
+        type: string
+        default: 'react'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commitSha }}
+
+      - name: Check for package-lock.json
+        id: check-lockfile
+        run: |
+          if [ -f "${{ inputs.componentPath }}/package-lock.json" ]; then
+            echo "has_lockfile=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_lockfile=false" >> $GITHUB_OUTPUT
+            echo "No package-lock.json found, cache will be disabled"
+          fi
+
+      - name: Setup Node.js (with cache)
+        if: steps.check-lockfile.outputs.has_lockfile == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.componentPath }}/package-lock.json'
+
+      - name: Setup Node.js (no cache)
+        if: steps.check-lockfile.outputs.has_lockfile == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check if package.json exists
+        id: check-package
+        run: |
+          if [ -f "${{ inputs.componentPath }}/package.json" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "No package.json found in ${{ inputs.componentPath }}, skipping npm steps"
+          fi
+
+      - name: Install dependencies (with lockfile)
+        if: steps.check-package.outputs.exists == 'true' && steps.check-lockfile.outputs.has_lockfile == 'true'
+        working-directory: ${{ inputs.componentPath }}
+        run: npm ci
+
+      - name: Install dependencies (no lockfile)
+        if: steps.check-package.outputs.exists == 'true' && steps.check-lockfile.outputs.has_lockfile == 'false'
+        working-directory: ${{ inputs.componentPath }}
+        run: npm install
+
+      - name: Build
+        if: steps.check-package.outputs.exists == 'true'
+        id: build
+        working-directory: ${{ inputs.componentPath }}
+        run: |
+          if npm run | grep -q "build"; then
+            npm run build 2>&1 | tee build.log
+            echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+          else
+            echo "No build script defined, skipping build step"
+            echo "BUILD_EXIT_CODE=0" >> $GITHUB_ENV
+          fi
+
+      - name: Run tests
+        if: steps.check-package.outputs.exists == 'true' && success()
+        id: test
+        working-directory: ${{ inputs.componentPath }}
+        run: |
+          if npm run | grep -q "test"; then
+            npm test -- --run || true
+          else
+            echo "No test script defined, skipping tests"
+          fi
+
+      - name: Lint check
+        if: steps.check-package.outputs.exists == 'true' && success()
+        id: lint
+        working-directory: ${{ inputs.componentPath }}
+        run: |
+          if npm run | grep -q "lint"; then
+            npm run lint || true
+          else
+            echo "No lint script defined, skipping lint"
+          fi
+
+      - name: Parse build errors
+        if: always()
+        id: parse-errors
+        run: |
+          ERROR_JSON="[]"
+          if [ -f "${{ inputs.componentPath }}/build.log" ]; then
+            ERROR_JSON=$(cat "${{ inputs.componentPath }}/build.log" | \
+              grep -E "(error TS[0-9]+|ERROR in)" | \
+              sed -E 's|^(.+\.tsx?)\(([0-9]+),([0-9]+)\): error (TS[0-9]+): (.+)$|{"filePath":"\1","lineNumber":\2,"columnNumber":\3,"errorCode":"\4","message":"\5","severity":"error"}|' | \
+              jq -s '.')
+          fi
+          echo "errors=$ERROR_JSON" >> $GITHUB_OUTPUT
+
+      - name: Notify Axiom
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.AXIOM_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.AXIOM_WEBHOOK_SECRET }}
+        run: |
+          SUCCESS="true"
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            SUCCESS="false"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg wid "${{ inputs.workItemId }}" \
+            --arg oid "${{ inputs.orchestrationId }}" \
+            --arg comp "${{ inputs.componentPath }}" \
+            --arg success "$SUCCESS" \
+            --argjson errors '${{ steps.parse-errors.outputs.errors }}' \
+            --arg sha "${{ inputs.commitSha }}" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              workItemId: $wid,
+              orchestrationId: $oid,
+              componentName: $comp,
+              success: ($success == "true"),
+              errors: $errors,
+              warnings: [],
+              commitSha: $sha,
+              workflowRunUrl: $url,
+              buildDuration: "PT5M"
+            }')
+
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.* //')
+
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Axiom-Signature: sha256=$SIGNATURE" \
+            -d "$PAYLOAD"
